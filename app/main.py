@@ -10,7 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
-from . import __version__, csv_ingest, db, service
+from . import __version__, claims, csv_ingest, db, service
 from .config import Settings
 from .errors import AppError
 
@@ -54,6 +54,39 @@ class PortIn(BaseModel):
         )
 
 
+CONSUMER_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+
+
+class ClaimIn(BaseModel):
+    consumer_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=CONSUMER_ID_PATTERN,
+        examples=["emission-accounting-01"],
+        description="排放核算进程的稳定标识；新标识从游标 0 开始",
+    )
+    limit: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description="本批最多领取的变更条数，按 seq 升序",
+    )
+
+
+class AcknowledgementIn(BaseModel):
+    consumer_id: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=CONSUMER_ID_PATTERN,
+        examples=["emission-accounting-01"],
+    )
+    claim_token: str = Field(
+        min_length=8,
+        max_length=200,
+        description="领取批次时返回的凭证；只有当前且未过期的凭证可确认",
+    )
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or Settings.from_env()
 
@@ -89,6 +122,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             {"name": "uploads", "description": "CSV 点位上传（原子、幂等）"},
             {"name": "events", "description": "当前现役靠港停留事件"},
             {"name": "changes", "description": "按游标顺序读取的事件变更流"},
+            {
+                "name": "change-claims",
+                "description": "按港区 + 消费者标识领取 / 确认变更（可恢复的批次消费）",
+            },
             {"name": "demo", "description": "迟到补点与撤回演示"},
             {"name": "system", "description": "健康检查"},
         ],
@@ -347,6 +384,79 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return service.list_changes(
                 conn, port_code=port_code, after=after, limit=limit
             )
+
+    @app.post(
+        "/ports/{port_code}/changes/claims",
+        tags=["change-claims"],
+        summary="按港区 + 消费者标识领取下一批变更",
+        description=(
+            "消费者由 `consumer_id` 标识（同一港区内唯一）。新消费者从游标 0 "
+            "开始，按 `seq` 升序领取最多 `limit` 条。\n\n"
+            "返回批次带不透明 `claim_token` 与 `expires_at` 到期时间。"
+            "**有效期内重复领取返回同一个批次与原边界**（`replayed=true`），"
+            "期间新上传的变更留到下一批。到期未确认的批次可重新领取，"
+            "旧凭证会被标记失效，无法越过新批次确认。\n\n"
+            "没有新变更时不创建租约，`lease` 为 null，稍后重新领取即可。"
+            "领取与确认都在 `BEGIN IMMEDIATE` 事务内完成，两个服务实例"
+            "交错请求时由 SQLite 写锁串行化，不会跳过变更或发出不同批次。"
+        ),
+        responses={
+            200: {"description": "已返回现有租约（重复领取）或当前无新变更"},
+            201: {"description": "新批次已领取，凭证与到期时间已生成"},
+        },
+    )
+    def claim_changes(port_code: str, body: ClaimIn, conn: Db) -> JSONResponse:
+        result = claims.claim_changes(
+            conn,
+            port_code=port_code,
+            consumer_id=body.consumer_id,
+            limit=body.limit,
+            ttl_seconds=resolved.change_lease_ttl_seconds,
+        )
+        created = bool(result["lease"] and not result["lease"]["replayed"])
+        return JSONResponse(status_code=201 if created else 200, content=result)
+
+    @app.post(
+        "/ports/{port_code}/changes/acknowledgements",
+        tags=["change-claims"],
+        summary="确认已领取的批次并推进消费者游标",
+        description=(
+            "只有**当前且未过期**租约的 `claim_token` 才能确认，确认后该消费者"
+            "的已确认游标推进到批次右边界。未知凭证 409 `invalid_claim_token`；"
+            "凭证已被新领取取代返回 409 `lease_superseded`；已过期返回 409 "
+            "`lease_expired`——这些失败都不会推进游标，重领后仍可接续。"
+            "对同一有效凭证重复确认是幂等的，返回相同结果。"
+        ),
+        responses={
+            200: {"description": "批次已确认（或确认的幂等重放）"},
+            404: {"description": "港区或消费者不存在"},
+            409: {"description": "凭证无效、已过期或已被新批次取代"},
+        },
+    )
+    def acknowledge_changes(
+        port_code: str, body: AcknowledgementIn, conn: Db
+    ) -> dict:
+        return claims.acknowledge_changes(
+            conn,
+            port_code=port_code,
+            consumer_id=body.consumer_id,
+            claim_token=body.claim_token,
+        )
+
+    @app.get(
+        "/ports/{port_code}/changes/consumers/{consumer_id}",
+        tags=["change-claims"],
+        summary="查看消费者的确认进度与当前租约",
+        description=(
+            "返回已确认游标、当前未完成租约（含边界与到期时间）。进程重启后"
+            "可据此判断从哪里接续：有有效租约时先凭原凭证确认或等待到期重领。"
+        ),
+        responses={404: {"description": "港区或消费者不存在"}},
+    )
+    def read_consumer_state(port_code: str, consumer_id: str, conn: Db) -> dict:
+        return claims.get_consumer_state(
+            conn, port_code=port_code, consumer_id=consumer_id
+        )
 
     if resolved.demo_enabled:
 

@@ -18,6 +18,7 @@ class Settings:
     max_upload_bytes: int = 10 * 1024 * 1024
     max_rows_per_upload: int = 100_000
     sqlite_busy_timeout_ms: int = 30_000
+    change_lease_ttl_seconds: int = 60
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -31,5 +32,8 @@ class Settings:
             max_rows_per_upload=int(os.getenv("AIS_MAX_ROWS", "100000")),
             sqlite_busy_timeout_ms=int(
                 os.getenv("AIS_SQLITE_BUSY_TIMEOUT_MS", "30000")
+            ),
+            change_lease_ttl_seconds=int(
+                os.getenv("AIS_CHANGE_LEASE_TTL_SECONDS", "60")
             ),
         )

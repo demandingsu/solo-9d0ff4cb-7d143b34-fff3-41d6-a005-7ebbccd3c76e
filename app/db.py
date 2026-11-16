@@ -15,7 +15,7 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ports (
@@ -109,6 +109,48 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Claim/ack (queueing) state for change-stream consumers.  A consumer is
+-- identified by (port, consumer_id), and its confirmed_cursor is the last seq
+-- it has acknowledged.  A brand-new consumer starts at 0.
+CREATE TABLE IF NOT EXISTS change_consumers (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    port_id          INTEGER NOT NULL REFERENCES ports(id),
+    consumer_id      TEXT    NOT NULL,
+    confirmed_cursor INTEGER NOT NULL DEFAULT 0 CHECK (confirmed_cursor >= 0),
+    active_lease_id  INTEGER REFERENCES change_leases(id),
+    created_at       TEXT    NOT NULL,
+    updated_at       TEXT    NOT NULL,
+    UNIQUE (port_id, consumer_id)
+);
+
+-- One row per claimed batch.  At most one row per consumer may be 'active'
+-- (the partial unique index enforces this even under interleaved writers),
+-- and BEGIN IMMEDIATE serialises claim/ack transactions so two instances can
+-- never hand out different batches for the same consumer at the same time.
+CREATE TABLE IF NOT EXISTS change_leases (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    port_id         INTEGER NOT NULL REFERENCES ports(id),
+    consumer_pk_id  INTEGER NOT NULL REFERENCES change_consumers(id),
+    claim_token     TEXT    NOT NULL UNIQUE,
+    cursor_from     INTEGER NOT NULL CHECK (cursor_from >= 0),
+    cursor_to       INTEGER NOT NULL CHECK (cursor_to >= cursor_from),
+    status          TEXT    NOT NULL
+                    CHECK (status IN ('active', 'acknowledged', 'expired',
+                                      'superseded')),
+    expires_at      TEXT    NOT NULL,
+    created_at      TEXT    NOT NULL,
+    acknowledged_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_change_leases_consumer
+    ON change_leases (consumer_pk_id, id);
+
+-- Defence in depth: a consumer may only hold one active lease.  Writers are
+-- already serialised by BEGIN IMMEDIATE, and this makes the invariant explicit.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_change_lease_one_active
+    ON change_leases (consumer_pk_id)
+    WHERE status = 'active';
 """
 
 
